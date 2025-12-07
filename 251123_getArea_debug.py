@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from re import S
 from tkinter import NO
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import math
@@ -16,6 +17,7 @@ import csv
 import os
 import argparse
 import sys
+from scipy.optimize import linprog
 
 # ----------------------------
 # 0) Hyperparameters & types
@@ -54,7 +56,7 @@ DEFAULT_ATOM_TYPES: Dict[AtomClass, AtomType] = {
     AtomClass.HYDROXYL_O:  AtomType(AtomClass.HYDROXYL_O,  True,  1.40, 1.40 + PROBE_RADIUS),
     AtomClass.THIOL_S:     AtomType(AtomClass.THIOL_S,     True,  2.00, 2.00 + PROBE_RADIUS),
     AtomClass.SULFUR_S:    AtomType(AtomClass.SULFUR_S,    True,  2.00, 2.00 + PROBE_RADIUS),
-    AtomClass.OTHER:       AtomType(AtomClass.OTHER,       True,  1.80, 1.80 + PROBE_RADIUS),
+    AtomClass.OTHER:       AtomType(AtomClass.OTHER,       True,  0.0, 0.0),
 }
 
 @dataclass
@@ -223,13 +225,14 @@ def circle_plane_for_neighbor(x_i: Vec3, r_i: float,
     d = np.linalg.norm(dvec)
     if d == 0.0:
         return None
-    m_k = dvec / d
-    g_k = (d*d + r_i*r_i - r_k*r_k) / (2.0*d)  # eq. (6)
+    m_k = dvec / d 
+    if d <= abs(r_i - r_k) and r_k >= r_i:
+        return None
+    g_k = (d*d + r_i*r_i - r_k*r_k) / (2.0*d)  # eq. (6) --> may be negative if the neighbor is very large
     # Simple culling: if neighbor too far to touch the central sphere, skip.
     if d >= (r_i + r_k):
         return None
-    
-    return Plane(n=m_k, g=g_k)
+    return Plane(n=m_k, g=g_k) # g may be negative, while m_k ALWAYS TOWARD NEIGHBOR ATOM CENTER - this is for information of center way, but needs to be addressed later for vector calculations
 
 def invert_vector(v: np.ndarray) -> np.ndarray:
     """
@@ -274,7 +277,7 @@ class PlaneLoopType(Enum):
 
 @dataclass
 class IHSPlane:
-    plane_index: PlaneIndex
+    plane_index: PlaneIndex # is ALWAYS EQUAL TO CORRESPONDING NEIGHBOR ATOM
     unit_vec: Vec3
     offset: float
     mu_vector: Vec3  # x_k - x_i unit vector.
@@ -536,6 +539,7 @@ def build_plane_topology(valid_planes: List[Plane],
 
     # 4. BFS TOPOLOGY REPAIR (Enforce Anti-Parallel Edges)
     # Pick robust seed: largest offset (safest normal)
+    # print ERROR if parallel planes detected and flipped
     if planes:
         seed = max(planes, key=lambda p: p.offset)
         queue = [seed]
@@ -578,6 +582,7 @@ def build_plane_topology(valid_planes: List[Plane],
                         idx_v = n_vs.index(my_v)
                         # If neighbor also goes u -> v, it's PARALLEL (BAD)
                         if (idx_u + 1) % len(n_vs) == idx_v:
+                            print(f"[ERROR] Parallel planes detected between planes {curr_idx} and {n_idx} - ORIENTATION LOGIC ERROR") # currently never happens; good
                             # FLIP
                             neighbor.vertex_order.reverse()
                             neighbor.vertex_inside_flags.reverse()
@@ -602,56 +607,168 @@ def build_plane_topology(valid_planes: List[Plane],
                     plane.edge_vertex_pairs.append((u, v))
     return planes
 
+def find_interior_point(planes: List[Plane]) -> Optional[np.ndarray]:
+    """
+    Finds a point x strictly inside the intersection of half-spaces defined by planes.
+    Uses SciPy Highs (Linear Programming).
+    
+    Problem: Find x such that n_i * x < g_i for all i.
+    Formulation: Maximize delta
+                 Subject to: n_i * x + delta <= g_i
+    
+    Returns:
+        x (np.ndarray): The shift vector (new origin relative to old origin).
+        None: If the intersection is empty (atom fully buried).
+    """
+    if not planes:
+        return np.zeros(3)
+
+    # Variables: [x, y, z, delta]
+    # Objective: Maximize delta => Minimize -delta
+    c = [0, 0, 0, -1] 
+
+    # Constraints: n_x*x + n_y*y + n_z*z + 1*delta <= g
+    A_ub = []
+    b_ub = []
+    
+    for p in planes:
+        # n . x + delta <= g
+        A_ub.append([p.n[0], p.n[1], p.n[2], 1.0])
+        b_ub.append(p.g)
+
+    # Bounds: x,y,z unbounded; delta >= 1e-5 (strictly interior)
+    bounds = [(None, None), (None, None), (None, None), (1e-6, None)]
+
+    try:
+        # 'highs' is the modern, robust solver in scipy
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success and res.x[3] > 0: # delta must be positive
+            return res.x[0:3]
+        else:
+            return None # Intersection is empty or a single point (buried)
+    except Exception:
+        return None
+
 def build_ihs_for_central_atom(mol: Molecule,
                                center_idx: int,
                                neighbor_indices: Iterable[int]) -> Tuple[IHS, List[Plane]]:
+    """
+    Builds the IHS topology.
+    Guarantee: The returned 'valid_planes_original' list is 1:1 mapped to ihs.planes indices.
+    ihs.planes[i] corresponds exactly to valid_planes_original[i].
+    """
     a_i = mol.atoms[center_idx]
     x_i = a_i.coord
     r_i = a_i.type.asa_radius
 
-    # 1. Candidate Planes
+    # ---------------------------------------------------------
+    # 1. Collect Constraints (Planes)
+    # ---------------------------------------------------------
     raw_planes: List[Plane] = []
+    
+    # 1-A. Real Neighbors
     for nb in neighbor_indices:
         a_k = mol.atoms[nb]
         pl = circle_plane_for_neighbor(x_i, r_i, a_k.coord, a_k.type.asa_radius)
         if pl is not None:
             raw_planes.append(pl)
             
+    # 1-B. Bounding Box (Virtual)
+    box_size = 50.0
     box_normals = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]]
     for n in box_normals:
-        raw_planes.append(Plane(n=np.array(n, dtype=float), g=30.0))
+        raw_planes.append(Plane(n=np.array(n, dtype=float), g=box_size))
 
-    # 2. Dual Hull
-    dual_points = build_dual_points(raw_planes)
+    if not raw_planes:
+        return IHS(planes=[], vertices=[], edges=[]), []
+
+    # ---------------------------------------------------------
+    # 2. Origin Shift Logic (Prevent Singularity)
+    # ---------------------------------------------------------
+    min_g = min(p.g for p in raw_planes)
+    x_shift = np.zeros(3)
+    used_planes_for_hull = raw_planes # Default: use original
+
+    # If origin is compromised, shift to a safe interior point
+    if min_g < 1e-4:
+        x_shift = find_interior_point(raw_planes)
+        
+        if x_shift is None:
+            # Fully buried (LP failed)
+            print("[OK] Atom fully buried; no accessible surface.")
+            return IHS(planes=[], vertices=[], edges=[]), []
+
+        # Shift planes: g' = g - n * x_shift
+        shifted_planes = []
+        for p in raw_planes:
+            g_prime = p.g - np.dot(p.n, x_shift)
+            shifted_planes.append(Plane(n=p.n, g=g_prime))
+        used_planes_for_hull = shifted_planes
+
+    # ---------------------------------------------------------
+    # 3. Build Dual Hull & Extract Vertices
+    # ---------------------------------------------------------
+    dual_points = build_dual_points(used_planes_for_hull)
+    
     try:
         hull = convex_hull_on_dual(dual_points)
-        raw_vertices = hull_faces_to_ihs_vertices(raw_planes, hull, r_i)
-    except Exception: # return empty IHS on failure
+        # Note: Vertices are in SHIFTED frame, indices refer to 'used_planes_for_hull'
+        vertices_shifted = hull_faces_to_ihs_vertices(used_planes_for_hull, hull, r_i)
+    except Exception: 
         return IHS(planes=[], vertices=[], edges=[]), []
 
-    if not raw_vertices: # return empty IHS on no vertices
-        print ("[ERROR] No IHS vertices generated")
+    if not vertices_shifted: 
         return IHS(planes=[], vertices=[], edges=[]), []
 
-    # 3. Filter & Remap (Standard)
-    active_plane_indices = set()
-    for v in raw_vertices:
-        for p_idx in v.planes: active_plane_indices.add(p_idx)
+    # ---------------------------------------------------------
+    # 4. Re-Indexing & Un-Shift (The Critical Fix)
+    # ---------------------------------------------------------
     
-    sorted_active = sorted(list(active_plane_indices))
-    old_to_new = {old: new for new, old in enumerate(sorted_active)}
-    valid_planes = [raw_planes[i] for i in sorted_active]
+    # (4-A) Identify ACTIVE indices (referring to raw_planes)
+    active_raw_indices = set()
+    for v in vertices_shifted: 
+        for raw_idx in v.planes: 
+            active_raw_indices.add(raw_idx)
+
+    # (4-B) Sort indices to create a deterministic mapping (0, 1, 2...)
+    sorted_raw_indices = sorted(list(active_raw_indices))
     
+    # Map: Raw Index (Old) -> Local Index (New, 0..N)
+    raw_to_local_map = {raw: local for local, raw in enumerate(sorted_raw_indices)}
+    
+    # (4-C) Create the Aligned Plane List (Original Geometry)
+    # This list corresponds 1:1 with the new local indices.
+    valid_planes_original = [raw_planes[i] for i in sorted_raw_indices]
+
     final_vertices = []
-    for v in raw_vertices:
-        new_planes = tuple(sorted(old_to_new[p] for p in v.planes))
-        final_vertices.append(IHSVertex(planes=new_planes, coord=v.coord, inside_sphere=v.inside_sphere))
+    for v in vertices_shifted:
+        # Restore coordinate to Original Frame
+        v_coord_original = v.coord + x_shift
+        
+        # Check inside/outside using original radius
+        dist_sq = float(np.dot(v_coord_original, v_coord_original))
+        inside_flag = dist_sq < (r_i * r_i + 1e-9)
 
-    # 4. Topology
+        # REMAP INDICES: Use the map to convert Raw -> Local
+        new_planes = tuple(sorted(raw_to_local_map[p] for p in v.planes))
+        
+        final_vertices.append(IHSVertex(
+            planes=new_planes, 
+            coord=v_coord_original, 
+            inside_sphere=inside_flag
+        ))
+
+    # ---------------------------------------------------------
+    # 5. Build Topology
+    # ---------------------------------------------------------
     ihs_edges = build_ihs_edges_from_face_adjacency(final_vertices)
-    ihs_planes = build_plane_topology(valid_planes, final_vertices, ihs_edges)
+    
+    # ihs_planes will be generated with indices 0..N
+    # valid_planes_original[i] provides the correct (n, g) for ihs_planes[i]
+    ihs_planes = build_plane_topology(valid_planes_original, final_vertices, ihs_edges)
 
-    return IHS(planes=ihs_planes, vertices=final_vertices, edges=ihs_edges), valid_planes
+    return IHS(planes=ihs_planes, vertices=final_vertices, edges=ihs_edges), valid_planes_original
 
 
 # ----------------------------------------------------------------
@@ -812,7 +929,7 @@ def _segment_sphere_intersections(p0: Vec3,
     return unique 
 
 
-def _inside_sphere(point: Vec3, radius_sq: float, tol: float = 1e-9) -> bool:
+def _inside_sphere(point: Vec3, radius_sq: float, tol: float = 1e-9) -> bool: # returns True if point is inside or on the sphere
     return float(np.dot(point, point)) <= radius_sq + tol
 
 
@@ -926,17 +1043,19 @@ def extract_gb_vertices_and_arcs(x_i: np.ndarray,
     loops: List[GBLoop] = []
     zero_vertex_planes: List[PlaneIndex] = []
     
-    # ... Zero vertex check (omitted for brevity, same as previous) ...
+    #original code below
     for plane in ihs.planes:
         has_verts = False
         for edge_idx in range(len(plane.edge_order)):
             if plane_edge_vertices.get((plane.plane_index, edge_idx)):
                 has_verts = True; break
-        if not has_verts:
-            if plane.vertex_order:
-                 center_chk = np.mean([ihs.vertices[v].coord for v in plane.vertex_order], axis=0)
-                 if not _inside_sphere(center_chk, radius_sq):
-                     zero_vertex_planes.append(plane.plane_index)
+        if not has_verts: # no other vertex with ihs pl
+            if plane.vertex_order: # has IHS vertices, check if any inside sphere
+                 center_chk = np.mean([ihs.vertices[v].coord for v in plane.vertex_order], axis=0) # if center point is inside sphere,
+                 if _inside_sphere(center_chk, radius_sq):
+                    all_inside = all(_inside_sphere(ihs.vertices[v].coord, radius_sq) for v in plane.vertex_order)
+                    if not all_inside:
+                        zero_vertex_planes.append(plane.plane_index)
 
     for start_idx, start_vertex in enumerate(gb_vertices):
         if start_vertex.visited: continue
@@ -1092,6 +1211,7 @@ def _recompute_vertex_eq13(plane_k: IHSPlane,
     
     if sin_phi_kj_sq < tol:
         # 두 평면이 (거의) 평행함 -> 교차점 계산 불가
+        print(f"[WARN] _recompute_vertex_eq13: Planes nearly parallel (sin^2(phi)={sin_phi_kj_sq})")
         return None
         
     sin_phi_kj = math.sqrt(sin_phi_kj_sq)
@@ -1111,6 +1231,7 @@ def _recompute_vertex_eq13(plane_k: IHSPlane,
     
     if gamma_kj_sq < 0.0:
         # 두 COI가 구면 위에서 만나지 않음 (허수)
+        print(f"[WARN] _recompute_vertex_eq13: No real intersection (gamma^2={gamma_kj_sq})")
         return None
         
     gamma_kj = math.sqrt(gamma_kj_sq)
@@ -1241,7 +1362,7 @@ def calculate_chi_user_logic(ihs, gb_topology, r_i: float) -> int:
     
     # Step 2: N_loops 계산 (검증 없이 len 그대로 사용)
     n_loops = len(gb_topology.loops) + len(gb_topology.zero_vertex_planes)
-    
+    print("[DEBUG] Number of loops, zero-vertex planes: ", len(gb_topology.loops), len(gb_topology.zero_vertex_planes))
     # Step 3: F_buried 계산
     # 논리: 전체 면적 수(N_loops + 1)에서 F_accessible을 뺀 나머지가 F_buried
     f_buried = (n_loops + 1) - f_accessible
@@ -1301,45 +1422,75 @@ def calculate_asa_from_gb_topology(gb_topology: GBTopology,
     term_omega_sum = 0.0
     term_phi_cos_theta_sum = 0.0
 
+    for zero_vertex_plane_idx in gb_topology.zero_vertex_planes:
+        try:
+            plane = all_ihs_planes[zero_vertex_plane_idx]
+        except IndexError: continue
+        cos_theta = plane.offset / r_i
+        if abs(cos_theta) > 1.0: 
+            print("[ERROR] zero vertex cos_theta_k out of bounds")
+            continue 
+        term_phi_cos_theta_sum += 2.0 * math.pi * cos_theta
     for loop in gb_topology.loops:
         v_indices = loop.vertex_indices; p_indices = loop.plane_indices
         n_verts = len(v_indices)
-        if n_verts < 2: continue
+        if n_verts < 2: 
+            print ("[ERROR] loop with 0~1 vertices found")
+            continue
         for i in range(n_verts):
             v_curr_idx = v_indices[i]; prev_arc_plane_idx = p_indices[i-1]
             curr_arc_plane_idx = p_indices[i]; v_next_idx = v_indices[(i+1)%n_verts]
+            print(f"[DEBUG] Processing GB Arc: V{v_curr_idx} (Plane {prev_arc_plane_idx} -> {curr_arc_plane_idx}) to V{v_next_idx}")
             try:
                 plane_j = all_ihs_planes[prev_arc_plane_idx]
                 plane_k = all_ihs_planes[curr_arc_plane_idx]
                 P_kj = exact_vertex_coords[v_curr_idx]
                 P_kl_next = exact_vertex_coords[v_next_idx]
-            except (KeyError, IndexError): continue
+            except (KeyError, IndexError): 
+                print ("[ERROR] failed to get planes or vertex coords for GB arc")
+                continue
             
             g_j_sq = plane_j.offset**2; a_j_sq = r_i*r_i - g_j_sq
-            if a_j_sq < tol: continue
+            if a_j_sq < tol: 
+                print("[ERROR] a_j_sq TOO SMALL "+ str(a_j_sq))
+                continue
             a_j = math.sqrt(a_j_sq)
             g_k_sq = plane_k.offset**2; a_k_sq = r_i*r_i - g_k_sq
-            if a_k_sq < tol: continue
+            if a_k_sq < tol: 
+                print("[ERROR] a_k_sq TOO SMALL "+ str(a_k_sq))
+                continue
             a_k = math.sqrt(a_k_sq)
 
-            m_k_ij = np.cross(plane_j.mu_vector, P_kj) / a_j
             n_j_ik = np.cross(plane_k.mu_vector, P_kj) / a_k
+            m_k_ij = np.cross(plane_j.mu_vector, P_kj) / a_j
             dot_omega = max(-1.0, min(1.0, np.dot(n_j_ik, m_k_ij)))
             Omega = -math.acos(dot_omega)
             term_omega_sum += Omega
 
             cos_theta_k = plane_k.offset / r_i
-            if abs(cos_theta_k) > 1.0: continue 
+            if abs(cos_theta_k) > 1.0: 
+                print("[ERROR] cos_theta_k out of bounds")
+                continue 
             m_l_ik = np.cross(plane_k.mu_vector, P_kl_next) / a_k
             dot_phi = max(-1.0, min(1.0, np.dot(n_j_ik, m_l_ik)))
             cross_phi = np.cross(n_j_ik, m_l_ik)
             S_jl_ik = math.copysign(1.0, np.dot(plane_k.mu_vector, cross_phi))
             Phi = (1.0 - S_jl_ik) * math.pi + S_jl_ik * math.acos(dot_phi)
+            if Phi < 0.0:
+                print("[ERROR] Negative Phi angle computed")
+                continue
+            if Phi > 2.0 * math.pi:
+                print("[ERROR] Phi angle exceeds 2pi")
+                continue
             term_phi_cos_theta_sum += Phi * cos_theta_k
 
     # --- 4. 최종 합산 ---
     A_i = r_i * r_i * (term_euler + term_omega_sum + term_phi_cos_theta_sum)
-    
+    if A_i < 0.0:
+        print ("[WARNING] Negative ASA total area", A_i, " each term: ", term_euler, term_omega_sum, term_phi_cos_theta_sum)
+    if A_i > 4.0 * math.pi * r_i * r_i:
+        print ("[WARNING] ASA exceeds total sphere area by ", A_i - 4.0 * math.pi * r_i * r_i, ", each term: ", term_euler, term_omega_sum, term_phi_cos_theta_sum)
+
     return A_i
 
 
@@ -1372,8 +1523,7 @@ def asa_of_central_atom(mol: Molecule,
     # ------------------------------
     
     # === [Pre-check 1] ===
-    if not ihs.vertices: 
-        print("[ERROR] No IHS vertices found - IHS didn't generate anything valid.")
+    if not ihs.vertices: # 0.0 by logic(don't calculate anything further)
         return 0.00
 
     gb_topology = extract_gb_vertices_and_arcs(x_i, r_i, plane_records, ihs)
@@ -1462,7 +1612,7 @@ def main():
 
     for atom, area in zip(mol.atoms, asas):
         # 1. Count Surface vs Buried
-        if area != 0.0 :
+        if area > 0.0 :
             surface_cnt += 1
         else:
             buried_cnt += 1
